@@ -1,0 +1,81 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: your_dockerhub_username/entrytracker
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Log in to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        push: true
+        tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+    - name: Install kubectl
+      run: |
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod +x kubectl
+        sudo mv kubectl /usr/local/bin/
+
+    - name: Install kind
+      run: |
+        curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-amd64
+        chmod +x ./kind
+        sudo mv ./kind /usr/local/bin/kind
+
+    - name: Create kind cluster
+      run: kind create cluster --wait 60s
+
+    - name: Apply MySQL Secret
+      run: kubectl apply -f k8s/mysql-secret.yaml
+
+    - name: Apply MySQL Service and StatefulSet
+      run: |
+        kubectl apply -f k8s/mysql-service.yaml
+        kubectl apply -f k8s/mysql-statefulset.yaml
+
+    - name: Wait for MySQL pod ready
+      run: kubectl wait --for=condition=ready pod/mysql-0 --timeout=300s
+
+    - name: Apply EntryTracker ConfigMap, Deployment and Service
+      run: |
+        sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" k8s/entrytracker-deployment.yaml
+        kubectl apply -f k8s/entrytracker-configmap.yaml
+        kubectl apply -f k8s/entrytracker-deployment.yaml
+        kubectl apply -f k8s/entrytracker-service.yaml
+
+    - name: Wait for EntryTracker deployment ready
+      run: kubectl rollout status deployment/entrytracker --timeout=180s
+
+    - name: Test MySQL connectivity
+      run: |
+        kubectl run mysql-client --rm -i --tty --image=mysql:5.7 --restart=Never -- mysql -h mysql-service -u$(kubectl get secret mysql-secret -o jsonpath="{.data.mysql-user}" | base64 --decode) -p$(kubectl get secret mysql-secret -o jsonpath="{.data.mysql-password}" | base64 --decode) entrytracker -e "SHOW TABLES;"
+
+    - name: Test EntryTracker HTTP response
+      run: |
+        POD_NAME=$(kubectl get pods -l app=entrytracker -o jsonpath="{.items[0].metadata.name}")
+        kubectl exec $POD_NAME -- curl -f http://localhost:5000/health
